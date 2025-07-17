@@ -1,9 +1,10 @@
-import React, { useState, useEffect, useRef } from 'react'
+import React, { useState, useEffect, useRef, useCallback } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
 import { Button } from '../components/ui/button'
 import { Card, CardContent, CardHeader, CardTitle } from '../components/ui/card'
 import { Input } from '../components/ui/input'
-import { ArrowLeft, Send, Bot, User, Loader2 } from 'lucide-react'
+import { ArrowLeft, Send, Bot, User, Loader2, MessageSquare } from 'lucide-react'
+import { blink } from '../blink/client'
 
 interface Message {
   id: string
@@ -14,36 +15,81 @@ interface Message {
 
 interface Project {
   id: string
-  name: string
+  projectName: string
   description: string
-  trackingFocus: string
+  trackingFocusAreas: string
+  scheduleFileName?: string
+  userId: string
+}
+
+interface ProjectAnalysis {
+  id: string
+  projectId: string
+  scheduleAnalysis: string
+  createdAt: string
 }
 
 const ChatInterface = () => {
   const { projectId } = useParams()
   const navigate = useNavigate()
+  const [user, setUser] = useState<any>(null)
   const [project, setProject] = useState<Project | null>(null)
+  const [projectAnalysis, setProjectAnalysis] = useState<ProjectAnalysis | null>(null)
   const [messages, setMessages] = useState<Message[]>([])
   const [inputValue, setInputValue] = useState('')
   const [isLoading, setIsLoading] = useState(false)
+  const [initialLoading, setInitialLoading] = useState(true)
   const messagesEndRef = useRef<HTMLDivElement>(null)
 
   useEffect(() => {
-    // Load project data
-    const savedProjects = localStorage.getItem('projects')
-    if (savedProjects && projectId) {
-      const projects = JSON.parse(savedProjects)
-      const currentProject = projects.find((p: Project) => p.id === projectId)
-      if (currentProject) {
+    const unsubscribe = blink.auth.onAuthStateChanged((state) => {
+      setUser(state.user)
+      if (state.user && projectId) {
+        loadProjectData()
+      }
+      setInitialLoading(false)
+    })
+    return unsubscribe
+  }, [projectId, loadProjectData])
+
+  const loadProjectData = useCallback(async () => {
+    if (!projectId) return
+
+    try {
+      // Load project data
+      const projectData = await blink.db.projects.list({
+        where: { id: projectId },
+        limit: 1
+      })
+
+      if (projectData.length > 0) {
+        const currentProject = projectData[0]
         setProject(currentProject)
+
+        // Try to load project analysis
+        try {
+          const analysisData = await blink.db.projectAnalysis.list({
+            where: { projectId },
+            limit: 1
+          })
+          if (analysisData.length > 0) {
+            setProjectAnalysis(analysisData[0])
+          }
+        } catch (error) {
+          console.log('No project analysis found, continuing without it')
+        }
+
         // Initialize with welcome message
-        setMessages([{
+        const welcomeMessage: Message = {
           id: '1',
           type: 'ai',
-          content: `Hello! I'm your AI Project Controls Agent for "${currentProject.name}". I'm here to help you provide detailed status updates. Let's start - what progress would you like to report today?`,
+          content: `Hello! I'm your AI Project Controls Agent for "${currentProject.projectName}". I'm here to help you provide detailed status updates that will be valuable for project tracking.\n\nBased on the project focus areas, I'll ask intelligent follow-up questions to ensure we capture all the important details. Let's start - what progress would you like to report today?`,
           timestamp: new Date()
-        }])
+        }
+        setMessages([welcomeMessage])
       }
+    } catch (error) {
+      console.error('Error loading project data:', error)
     }
   }, [projectId])
 
@@ -51,26 +97,50 @@ const ChatInterface = () => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
   }, [messages])
 
-  const generateAIResponse = (userMessage: string): string => {
-    // Simple AI response simulation - in real app, this would call OpenAI API
-    const responses = [
-      "That's helpful information. Can you provide more specific details about the timeline? When do you expect this to be completed?",
-      "Thanks for the update. What challenges, if any, are you currently facing with this task?",
-      "Good progress! Can you quantify the percentage of completion for this work item?",
-      "I understand. Are there any dependencies or resources you need from other team members?",
-      "That sounds like significant progress. How does this align with the original project schedule?",
-      "Thanks for sharing. What are the next immediate steps you plan to take?",
-      "Interesting. Are there any risks or potential delays you foresee?",
-      "Great update! Can you provide more details about the quality of work completed?",
-      "I see. How does this impact other related tasks or milestones?",
-      "Thank you for the detailed information. Is there anything else you'd like to add about this update?"
-    ]
-    
-    return responses[Math.floor(Math.random() * responses.length)]
+  const generateAIResponse = async (userMessage: string, conversationHistory: Message[]): Promise<string> => {
+    try {
+      // Build context for the AI
+      let context = `You are an AI Project Controls Agent helping contractors provide detailed status updates for project tracking.
+
+Project: ${project?.projectName}
+Description: ${project?.description}
+Focus Areas: ${project?.trackingFocusAreas}
+`
+
+      if (projectAnalysis) {
+        context += `\nProject Schedule Analysis: ${projectAnalysis.scheduleAnalysis}\n`
+      }
+
+      context += `
+Your role is to:
+1. Ask intelligent follow-up questions to get specific, actionable project status information
+2. Focus on details that would be valuable for project managers to track progress
+3. Ask about timelines, percentages, blockers, dependencies, quality, and next steps
+4. Keep questions conversational but professional
+5. Don't ask more than 2-3 questions at once
+
+Conversation history:
+${conversationHistory.slice(-6).map(msg => `${msg.type === 'user' ? 'Contractor' : 'AI Agent'}: ${msg.content}`).join('\n')}
+
+Latest contractor message: ${userMessage}
+
+Respond as the AI Project Controls Agent with intelligent follow-up questions or acknowledgments. Be helpful and professional.`
+
+      const response = await blink.ai.generateText({
+        prompt: context,
+        model: 'gpt-4o-mini',
+        maxTokens: 300
+      })
+
+      return response.text
+    } catch (error) {
+      console.error('Error generating AI response:', error)
+      return "I apologize, but I'm having trouble processing your message right now. Could you please try again? In the meantime, feel free to provide any additional details about your project progress."
+    }
   }
 
   const handleSendMessage = async () => {
-    if (!inputValue.trim() || isLoading) return
+    if (!inputValue.trim() || isLoading || !user) return
 
     const userMessage: Message = {
       id: Date.now().toString(),
@@ -83,17 +153,54 @@ const ChatInterface = () => {
     setInputValue('')
     setIsLoading(true)
 
-    // Simulate AI processing delay
-    setTimeout(() => {
+    try {
+      // Generate AI response
+      const aiResponseText = await generateAIResponse(inputValue, [...messages, userMessage])
+      
       const aiResponse: Message = {
         id: (Date.now() + 1).toString(),
         type: 'ai',
-        content: generateAIResponse(inputValue),
+        content: aiResponseText,
         timestamp: new Date()
       }
+
       setMessages(prev => [...prev, aiResponse])
+
+      // Store the conversation in the database for project tracking
+      try {
+        await blink.db.statusUpdates.create({
+          id: `update_${Date.now()}`,
+          projectId: projectId!,
+          userId: user.id,
+          userMessage: inputValue,
+          aiResponse: aiResponseText,
+          timestamp: new Date().toISOString()
+        })
+
+        // Update project's update count
+        if (project) {
+          await blink.db.projects.update(project.id, {
+            updatesCount: (project.updatesCount || 0) + 1,
+            lastUpdate: new Date().toISOString()
+          })
+        }
+      } catch (dbError) {
+        console.error('Error storing conversation:', dbError)
+        // Continue even if database storage fails
+      }
+
+    } catch (error) {
+      console.error('Error in chat:', error)
+      const errorResponse: Message = {
+        id: (Date.now() + 1).toString(),
+        type: 'ai',
+        content: "I apologize, but I'm experiencing some technical difficulties. Please try your message again, and I'll do my best to help you provide a detailed status update.",
+        timestamp: new Date()
+      }
+      setMessages(prev => [...prev, errorResponse])
+    } finally {
       setIsLoading(false)
-    }, 1500)
+    }
   }
 
   const handleKeyPress = (e: React.KeyboardEvent) => {
@@ -103,12 +210,39 @@ const ChatInterface = () => {
     }
   }
 
+  if (initialLoading) {
+    return (
+      <div className="min-h-screen bg-background flex items-center justify-center">
+        <div className="text-center">
+          <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-primary mx-auto mb-4"></div>
+          <p className="text-muted-foreground">Loading chat interface...</p>
+        </div>
+      </div>
+    )
+  }
+
+  if (!user) {
+    return (
+      <div className="min-h-screen bg-background flex items-center justify-center">
+        <Card className="w-full max-w-md">
+          <CardHeader className="text-center">
+            <CardTitle>Authentication Required</CardTitle>
+            <CardDescription>Please sign in to access the chat interface</CardDescription>
+          </CardHeader>
+          <CardContent className="text-center">
+            <Button onClick={() => blink.auth.login()}>Sign In</Button>
+          </CardContent>
+        </Card>
+      </div>
+    )
+  }
+
   if (!project) {
     return (
-      <div className="min-h-screen bg-slate-50 flex items-center justify-center">
+      <div className="min-h-screen bg-background flex items-center justify-center">
         <div className="text-center">
-          <h2 className="text-xl font-semibold text-slate-900 mb-2">Project not found</h2>
-          <p className="text-slate-600 mb-4">The project you're looking for doesn't exist or has been removed.</p>
+          <h2 className="text-xl font-semibold text-foreground mb-2">Project not found</h2>
+          <p className="text-muted-foreground mb-4">The project you're looking for doesn't exist or has been removed.</p>
           <Button onClick={() => navigate('/contractor')}>
             Back to Projects
           </Button>
@@ -118,9 +252,9 @@ const ChatInterface = () => {
   }
 
   return (
-    <div className="min-h-screen bg-slate-50 flex flex-col">
+    <div className="min-h-screen bg-background flex flex-col">
       {/* Header */}
-      <header className="border-b bg-white flex-shrink-0">
+      <header className="border-b bg-white/80 backdrop-blur-sm flex-shrink-0 sticky top-0 z-50">
         <div className="max-w-4xl mx-auto px-4 sm:px-6 lg:px-8">
           <div className="flex items-center justify-between h-16">
             <div className="flex items-center space-x-4">
@@ -128,20 +262,19 @@ const ChatInterface = () => {
                 variant="ghost" 
                 size="sm"
                 onClick={() => navigate('/contractor')}
-                className="text-slate-600 hover:text-slate-900"
               >
                 <ArrowLeft className="w-4 h-4 mr-2" />
                 Back to Projects
               </Button>
-              <div className="h-6 w-px bg-slate-300"></div>
+              <div className="h-6 w-px bg-border"></div>
               <div>
-                <h1 className="text-lg font-semibold text-slate-900">{project.name}</h1>
-                <p className="text-sm text-slate-600">AI Project Controls Agent</p>
+                <h1 className="text-lg font-semibold text-foreground">{project.projectName}</h1>
+                <p className="text-sm text-muted-foreground">AI Project Controls Agent</p>
               </div>
             </div>
             <div className="flex items-center space-x-2">
               <div className="w-2 h-2 bg-green-500 rounded-full"></div>
-              <span className="text-sm text-slate-600">AI Online</span>
+              <span className="text-sm text-muted-foreground">AI Online</span>
             </div>
           </div>
         </div>
@@ -156,23 +289,23 @@ const ChatInterface = () => {
                 <div className={`flex items-start space-x-3 max-w-3xl ${message.type === 'user' ? 'flex-row-reverse space-x-reverse' : ''}`}>
                   <div className={`w-8 h-8 rounded-full flex items-center justify-center flex-shrink-0 ${
                     message.type === 'user' 
-                      ? 'bg-orange-100' 
-                      : 'bg-blue-100'
+                      ? 'bg-accent/20' 
+                      : 'bg-primary/20'
                   }`}>
                     {message.type === 'user' ? (
-                      <User className="w-4 h-4 text-orange-600" />
+                      <User className="w-4 h-4 text-accent" />
                     ) : (
-                      <Bot className="w-4 h-4 text-blue-600" />
+                      <Bot className="w-4 h-4 text-primary" />
                     )}
                   </div>
                   <div className={`rounded-lg px-4 py-3 ${
                     message.type === 'user'
-                      ? 'bg-orange-600 text-white'
-                      : 'bg-white border border-slate-200 text-slate-900'
+                      ? 'bg-accent text-accent-foreground'
+                      : 'bg-white border border-border text-foreground shadow-sm'
                   }`}>
-                    <p className="text-sm leading-relaxed">{message.content}</p>
+                    <p className="text-sm leading-relaxed whitespace-pre-wrap">{message.content}</p>
                     <p className={`text-xs mt-2 ${
-                      message.type === 'user' ? 'text-orange-100' : 'text-slate-500'
+                      message.type === 'user' ? 'text-accent-foreground/70' : 'text-muted-foreground'
                     }`}>
                       {message.timestamp.toLocaleTimeString()}
                     </p>
@@ -184,13 +317,13 @@ const ChatInterface = () => {
             {isLoading && (
               <div className="flex justify-start">
                 <div className="flex items-start space-x-3 max-w-3xl">
-                  <div className="w-8 h-8 rounded-full bg-blue-100 flex items-center justify-center flex-shrink-0">
-                    <Bot className="w-4 h-4 text-blue-600" />
+                  <div className="w-8 h-8 rounded-full bg-primary/20 flex items-center justify-center flex-shrink-0">
+                    <Bot className="w-4 h-4 text-primary" />
                   </div>
-                  <div className="bg-white border border-slate-200 rounded-lg px-4 py-3">
+                  <div className="bg-white border border-border rounded-lg px-4 py-3 shadow-sm">
                     <div className="flex items-center space-x-2">
-                      <Loader2 className="w-4 h-4 animate-spin text-blue-600" />
-                      <span className="text-sm text-slate-600">AI is thinking...</span>
+                      <Loader2 className="w-4 h-4 animate-spin text-primary" />
+                      <span className="text-sm text-muted-foreground">AI is analyzing your update...</span>
                     </div>
                   </div>
                 </div>
@@ -201,7 +334,7 @@ const ChatInterface = () => {
           </div>
 
           {/* Input Area */}
-          <Card className="flex-shrink-0">
+          <Card className="flex-shrink-0 shadow-lg">
             <CardContent className="p-4">
               <div className="flex space-x-3">
                 <Input
@@ -215,16 +348,38 @@ const ChatInterface = () => {
                 <Button 
                   onClick={handleSendMessage}
                   disabled={!inputValue.trim() || isLoading}
-                  className="bg-orange-600 hover:bg-orange-700"
+                  className="px-6"
                 >
                   <Send className="w-4 h-4" />
                 </Button>
               </div>
-              <p className="text-xs text-slate-500 mt-2">
+              <p className="text-xs text-muted-foreground mt-2">
                 Press Enter to send, Shift+Enter for new line
               </p>
             </CardContent>
           </Card>
+        </div>
+      </div>
+
+      {/* Project Context Card */}
+      <div className="border-t bg-muted/30">
+        <div className="max-w-4xl mx-auto px-4 sm:px-6 lg:px-8 py-3">
+          <div className="flex items-center justify-between text-sm">
+            <div className="flex items-center space-x-4">
+              <div className="flex items-center space-x-2">
+                <MessageSquare className="w-4 h-4 text-muted-foreground" />
+                <span className="text-muted-foreground">Focus Areas:</span>
+                <span className="text-foreground font-medium truncate max-w-md">
+                  {project.trackingFocusAreas}
+                </span>
+              </div>
+            </div>
+            {project.scheduleFileName && (
+              <div className="text-muted-foreground">
+                Schedule: {project.scheduleFileName}
+              </div>
+            )}
+          </div>
         </div>
       </div>
     </div>
